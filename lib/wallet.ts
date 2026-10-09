@@ -1,0 +1,24 @@
+import forge from 'node-forge';
+import {zipSync,strToU8} from 'fflate';
+import {env} from 'cloudflare:workers';
+import {icon} from './wallet-icon';
+export type WalletCard={id:string,name:string,color:string,reward:string,target:number,balance:number};
+const cfg=()=>env as unknown as Record<string,string>;
+export function walletStatus(){const e=cfg();return {apple:['APPLE_PASS_TYPE_ID','APPLE_TEAM_ID','APPLE_PASS_CERT','APPLE_PASS_KEY','APPLE_WWDR_CERT'].every(k=>!!e[k]),google:['GOOGLE_WALLET_ISSUER_ID','GOOGLE_WALLET_CLASS_ID','GOOGLE_SERVICE_ACCOUNT_EMAIL','GOOGLE_SERVICE_ACCOUNT_KEY'].every(k=>!!e[k])}}
+function color(hex:string){return 'rgb('+[1,3,5].map(i=>parseInt(hex.slice(i,i+2),16)).join(', ')+')'}
+export function applePass(card:WalletCard,origin:string){
+ const e=cfg(); if(!walletStatus().apple)throw Error('Apple Wallet is nog niet geactiveerd. De uitgever moet eerst de Apple-certificaten koppelen.');
+ const pass={formatVersion:1,passTypeIdentifier:e.APPLE_PASS_TYPE_ID,teamIdentifier:e.APPLE_TEAM_ID,serialNumber:card.id,organizationName:card.name,description:card.name+' klantenkaart',logoText:card.name,foregroundColor:'rgb(255, 255, 255)',backgroundColor:color(card.color),labelColor:'rgb(221, 234, 181)',barcodes:[{format:'PKBarcodeFormatQR',message:origin+'/card/'+card.id,messageEncoding:'iso-8859-1',altText:card.id.slice(0,8).toUpperCase()}],storeCard:{primaryFields:[{key:'stamps',label:'JOUW STEMPELS',value:String(card.balance)+' / '+card.target}],secondaryFields:[{key:'reward',label:'JOUW BELONING',value:card.reward}],backFields:[{key:'current',label:'Actueel saldo',value:origin+'/card/'+card.id},{key:'info',label:'Over deze kaart',value:'Deze eerste versie wordt niet automatisch bijgewerkt. Open de webkaart voor je actuele saldo en download een nieuwe kaart na een bezoek.'}]}};
+ const files:Record<string,Uint8Array>={'pass.json':strToU8(JSON.stringify(pass)),'icon.png':Uint8Array.from(atob(icon),c=>c.charCodeAt(0)),'icon@2x.png':Uint8Array.from(atob(icon),c=>c.charCodeAt(0))};
+ const manifest:Record<string,string>={};for(const [path,bytes] of Object.entries(files)){const hash=forge.md.sha1.create();hash.update(String.fromCharCode(...bytes));manifest[path]=hash.digest().toHex()}
+ files['manifest.json']=strToU8(JSON.stringify(manifest));
+ const signed=forge.pkcs7.createSignedData();signed.content=forge.util.createBuffer(String.fromCharCode(...files['manifest.json']));signed.addCertificate(e.APPLE_PASS_CERT);signed.addCertificate(e.APPLE_WWDR_CERT);signed.addSigner({key:e.APPLE_PASS_KEY,certificate:e.APPLE_PASS_CERT,digestAlgorithm:forge.pki.oids.sha256,authenticatedAttributes:[{type:forge.pki.oids.contentType,value:forge.pki.oids.data},{type:forge.pki.oids.messageDigest},{type:forge.pki.oids.signingTime,value:new Date() as unknown as string}]});signed.sign({detached:true});const der=forge.asn1.toDer(signed.toAsn1()).getBytes();files.signature=Uint8Array.from(der,c=>c.charCodeAt(0));return zipSync(files);
+}
+function b64(bytes:Uint8Array){return btoa(String.fromCharCode(...bytes)).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_')}
+export async function googlePass(card:WalletCard,origin:string){
+ const e=cfg();if(!walletStatus().google)throw Error('Google Wallet is nog niet geactiveerd. De uitgever moet eerst het Google Wallet-account koppelen.');
+ const object={id:e.GOOGLE_WALLET_ISSUER_ID+'.'+card.id.replace(/-/g,'_'),classId:e.GOOGLE_WALLET_CLASS_ID,state:'ACTIVE',hexBackgroundColor:card.color,cardTitle:{defaultValue:{language:'nl',value:card.name}},header:{defaultValue:{language:'nl',value:card.balance+' / '+card.target+' stempels'}},subheader:{defaultValue:{language:'nl',value:'KLANTENKAART'}},barcode:{type:'QR_CODE',value:origin+'/card/'+card.id},textModulesData:[{id:'reward',header:'Jouw beloning',body:card.reward},{id:'refresh',header:'Actueel saldo',body:'Open de webkaart voor je actuele saldo. Automatische Wallet-updates volgen in een volgende versie.'}],linksModuleData:{uris:[{id:'webcard',uri:origin+'/card/'+card.id,description:'Bekijk je actuele klantenkaart'}]}};
+ const payload={iss:e.GOOGLE_SERVICE_ACCOUNT_EMAIL,aud:'google',typ:'savetowallet',iat:Math.floor(Date.now()/1000),origins:[new URL(origin).host],payload:{genericObjects:[object]}};
+ const encoder=new TextEncoder();const input=b64(encoder.encode(JSON.stringify({alg:'RS256',typ:'JWT'})))+'.'+b64(encoder.encode(JSON.stringify(payload)));
+ const raw=e.GOOGLE_SERVICE_ACCOUNT_KEY.replace(/-----[^-]+-----/g,'').replace(/\s/g,'');const key=await crypto.subtle.importKey('pkcs8',Uint8Array.from(atob(raw),c=>c.charCodeAt(0)),{name:'RSASSA-PKCS1-v1_5',hash:'SHA-256'},false,['sign']);const sig=await crypto.subtle.sign('RSASSA-PKCS1-v1_5',key,encoder.encode(input));return 'https://pay.google.com/gp/v/save/'+input+'.'+b64(new Uint8Array(sig));
+}
